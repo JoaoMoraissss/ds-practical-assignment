@@ -1,0 +1,44 @@
+Distributed Systems 2026/27 - Practical Assignment
+===================================================
+
+Plain Java (JDK 11 or newer), no external dependencies.
+
+Layout
+------
+  src/ds/assignment/tring   Exercise 1 - mutual exclusion with a token ring
+  src/ds/assignment/p2p     Exercise 2 - anti-entropy in a P2P network
+  src/ds/assignment/tom     Exercise 3 - totally-ordered multicast
+  scripts/                  build and run scripts
+
+Compiling
+---------
+  $ ./scripts/build.sh
+
+The classes are written to build/.
+
+Exercise 1 - Token Ring
+-----------------------
+Quick demo on a single machine (server + 5 peers on different ports):
+
+  $ ./scripts/tring-local.sh
+
+On 6 machines (m1..m5 for the peers, m6 for the server), after compiling on each:
+
+  m6$ java -cp build ds.assignment.tring.Server
+  m2$ java -cp build ds.assignment.tring.Peer IP-of-m3 IP-of-m6
+  m3$ java -cp build ds.assignment.tring.Peer IP-of-m4 IP-of-m6
+  m4$ java -cp build ds.assignment.tring.Peer IP-of-m5 IP-of-m6
+  m5$ java -cp build ds.assignment.tring.Peer IP-of-m1 IP-of-m6
+  m1$ java -cp build ds.assignment.tring.Peer IP-of-m2 IP-of-m6 --token
+
+Exactly one peer is started with --token: it creates the token and puts it in
+circulation. Start it last, or in any order: a peer keeps retrying until the
+next one is reachable.
+
+Peer options:
+  --port N      port where this peer waits for the token (default 5000)
+  --name NAME   label used in the output (default: the host name)
+  --token       this peer creates the token
+
+The server listens on port 6000 by default; pass another port as its only
+argument. Hosts may be given as host:port when the defaults are not used.
