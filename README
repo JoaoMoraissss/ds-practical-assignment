@@ -42,3 +42,32 @@ Peer options:
 
 The server listens on port 6000 by default; pass another port as its only
 argument. Hosts may be given as host:port when the defaults are not used.
+
+Fault tolerance (extra marks)
+-----------------------------
+The token keeps moving when a peer fails:
+
+  * Skipping a dead peer. A peer that receives the token replies with
+    "ACK <address of its own next peer>". The sender therefore learns who comes
+    two positions ahead without any extra configuration. If the next peer does
+    not acknowledge the token, it is sent to that second peer instead. The
+    original next peer is tried first on every round, so a peer that is
+    restarted rejoins the ring by itself.
+
+  * Regenerating a lost token. If a peer dies while holding the token, the
+    others stop seeing it. A peer that sees no token for 20 to 30 seconds (the
+    exact value is random per peer) creates a new one. The token carries a
+    generation number (epoch) that is incremented on regeneration, and a peer
+    discards any token with an epoch lower than the highest it has seen, so an
+    old token that reappears does not circulate together with the new one.
+
+To try it with the local demo running, from another terminal:
+
+  $ pkill -f "name p3"        # the ring continues with 4 peers
+  $ java -cp build ds.assignment.tring.Peer localhost:5004 localhost:6000 \
+        --port 5003 --name p3                       # p3 rejoins
+
+Limitations: two consecutive dead peers stop the ring, because only one backup
+address is known. If two peers regenerate the token within the same few
+seconds, two tokens with the same epoch exist; the random part of the timeout
+makes this unlikely but not impossible.
