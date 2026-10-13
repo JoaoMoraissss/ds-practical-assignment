@@ -20,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * A peer of the anti-entropy network.
  *
- * Usage: Peer [neighbour-host[:port] ...] [--port N] [--name NAME] [--value V]
+ * Usage: Peer [neighbour-host[:port] ...] [--port N] [--name NAME] [--value V] [--rate R]
  *
  * One thread waits for connections: other peers register themselves with it, or
  * ask it to synchronize. The main thread registers this peer with the neighbours
@@ -30,7 +30,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class Peer {
     static final int DEFAULT_PORT = 7000;
 
-    private static final double SYNCS_PER_MINUTE = 2.0;
+    private static final double DEFAULT_SYNCS_PER_MINUTE = 2.0;
     private static final int CONNECT_TIMEOUT_MS = 2000;
     private static final int REPLY_TIMEOUT_MS = 2000;
     private static final long RETRY_MS = 1000;
@@ -39,20 +39,23 @@ public class Peer {
 
     private final String name;
     private final int port;
+    private final double syncsPerMinute;
     // Peers that registered with us, or that we registered with: "host:port" -> address.
     private final Map<String, InetSocketAddress> neighbours = new ConcurrentHashMap<>();
     private double value;   // guarded by "this"
 
-    Peer(String name, int port, double value) {
+    Peer(String name, int port, double value, double syncsPerMinute) {
         this.name = name;
         this.port = port;
         this.value = value;
+        this.syncsPerMinute = syncsPerMinute;
     }
 
     public static void main(String[] args) throws Exception {
         int port = DEFAULT_PORT;
         String name = InetAddress.getLocalHost().getHostName();
         double value = new Random().nextDouble();
+        double syncsPerMinute = DEFAULT_SYNCS_PER_MINUTE;
         List<String> contacts = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -68,16 +71,20 @@ public class Peer {
                     if (++i == args.length) usage();
                     value = Double.parseDouble(args[i]);
                     break;
+                case "--rate":
+                    if (++i == args.length) usage();
+                    syncsPerMinute = Double.parseDouble(args[i]);
+                    break;
                 default:
                     if (args[i].startsWith("--")) usage();
                     contacts.add(args[i]);
             }
         }
-        new Peer(name, port, value).run(contacts);
+        new Peer(name, port, value, syncsPerMinute).run(contacts);
     }
 
     private static void usage() {
-        System.err.println("usage: Peer [neighbour-host[:port] ...] [--port N] [--name NAME] [--value V]");
+        System.err.println("usage: Peer [neighbour-host[:port] ...] [--port N] [--name NAME] [--value V] [--rate R]");
         System.exit(1);
     }
 
@@ -138,13 +145,15 @@ public class Peer {
             } else if (parts.length == 2 && parts[0].equals("SYNC")) {
                 double theirs = Double.parseDouble(parts[1]);
                 double mine;
+                // Logged while holding the lock, so that the lines of a peer come
+                // out in the order in which its value changed.
                 synchronized (this) {
                     mine = value;
                     value = (mine + theirs) / 2;
+                    log(String.format(Locale.ROOT, "sync from %s: %.6f and %.6f -> %.6f",
+                            socket.getInetAddress().getHostAddress(), mine, theirs, value));
                 }
                 out.println("VALUE " + mine);
-                log(String.format(Locale.ROOT, "sync from %s: %.6f and %.6f -> %.6f",
-                        socket.getInetAddress().getHostAddress(), mine, theirs, getValue()));
             }
         } catch (IOException | NumberFormatException e) {
             log("bad message: " + e.getMessage());
@@ -172,7 +181,7 @@ public class Peer {
     /** Synchronizations form a Poisson process, so the gaps between them are exponential. */
     private void synchronizeForever() throws InterruptedException {
         Random random = new Random();
-        double ratePerMs = SYNCS_PER_MINUTE / 60_000.0;
+        double ratePerMs = syncsPerMinute / 60_000.0;
         while (true) {
             Thread.sleep((long) (-Math.log(1.0 - random.nextDouble()) / ratePerMs));
             List<InetSocketAddress> candidates = new ArrayList<>(neighbours.values());
@@ -199,12 +208,10 @@ public class Peer {
             return;
         }
         double theirs = Double.parseDouble(reply.substring(6));
-        double updated;
         synchronized (this) {
             value += (theirs - sent) / 2;
-            updated = value;
+            log(String.format(Locale.ROOT, "sync with %s: %.6f and %.6f -> %.6f", key(neighbour), sent, theirs, value));
         }
-        log(String.format(Locale.ROOT, "sync with %s: %.6f and %.6f -> %.6f", key(neighbour), sent, theirs, updated));
     }
 
     /** Sends one line to target and returns the one-line reply, or null on failure. */
