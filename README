@@ -71,3 +71,40 @@ Limitations: two consecutive dead peers stop the ring, because only one backup
 address is known. If two peers regenerate the token within the same few
 seconds, two tokens with the same epoch exist; the random part of the timeout
 makes this unlikely but not impossible.
+
+Exercise 2 - Anti-Entropy
+-------------------------
+Quick demo on a single machine (6 peers on different ports, with the topology
+of the figure: p1-p2, p2-p3, p2-p4, p4-p5, p4-p6):
+
+  $ ./scripts/p2p-local.sh          # every peer starts with a random value
+  $ ./scripts/p2p-local.sh one      # p1 starts with 1, the others with 0
+
+On 6 machines, after compiling on each:
+
+  m4$ java -cp build ds.assignment.p2p.Peer
+  m2$ java -cp build ds.assignment.p2p.Peer IP-of-m4
+  m1$ java -cp build ds.assignment.p2p.Peer IP-of-m2
+  m3$ java -cp build ds.assignment.p2p.Peer IP-of-m2
+  m5$ java -cp build ds.assignment.p2p.Peer IP-of-m4
+  m6$ java -cp build ds.assignment.p2p.Peer IP-of-m4
+
+A peer registers itself with the peers given as arguments, and both sides add
+each other to their maps, so each link of the figure is given only once. The
+peers can be started in any order: a peer keeps retrying until its neighbour is
+reachable.
+
+Peer options:
+  --port N      port where this peer waits for connections (default 7000)
+  --name NAME   label used in the output (default: the host name)
+  --value V     initial value (default: random in (0, 1))
+
+Twice per minute on average (Poisson process), a peer picks a random neighbour
+and sends it "SYNC <value>". The neighbour moves to the average of the two
+values and replies with the value it had. The first peer then applies the
+opposite change to its own value instead of overwriting it, so the sum of all
+values is preserved even when a third peer synchronizes with it in between.
+All values therefore converge to the average of the initial ones.
+
+To see the network size being estimated, add "--value 0" to every peer except
+one, which gets "--value 1": the values converge to 1/6.
