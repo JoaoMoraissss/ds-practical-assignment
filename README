@@ -98,6 +98,7 @@ Peer options:
   --port N      port where this peer waits for connections (default 7000)
   --name NAME   label used in the output (default: the host name)
   --value V     initial value (default: random in (0, 1))
+  --rate R      synchronizations per minute (default 2)
 
 Twice per minute on average (Poisson process), a peer picks a random neighbour
 and sends it "SYNC <value>". The neighbour moves to the average of the two
@@ -108,3 +109,30 @@ All values therefore converge to the average of the initial ones.
 
 To see the network size being estimated, add "--value 0" to every peer except
 one, which gets "--value 1": the values converge to 1/6.
+
+Convergence time (extra marks)
+------------------------------
+  $ ./scripts/p2p-convergence.py                    # sizes 4 8 16 24 32 48 64
+  $ ./scripts/p2p-convergence.py 5 10 20 --runs 3   # chosen sizes
+  $ ./scripts/p2p-plot.py                           # needs Python's matplotlib
+
+For each size N, the first script starts N peers as local processes, with one
+peer set to 1 and the others to 0, and measures how long they take to converge.
+Each simulation uses a new random topology: every peer is linked to a random
+peer started before it, which gives a random tree and therefore a connected
+network, and then N/2 random links are added. The results are appended to
+results/p2p-convergence.csv, and the second script plots them into
+results/p2p-convergence.png.
+
+  * Convergence: the script follows the value of each peer in its output, and
+    the network has converged when every peer is within 1% of 1/N (--tolerance).
+    The clock starts when the last link of the network is registered.
+
+  * Rate: at 2 synchronizations per minute a simulation with 64 peers takes about an
+    hour, so the simulations run at 300 per minute (--rate). A message between
+    local peers takes about a millisecond, so the convergence time only depends
+    on how often the peers synchronize; the plot scales the measured times to
+    what they would be at 2 per minute.
+
+  * Each size is simulated 5 times (--runs); the plot shows every simulation
+    and the mean for each size.
