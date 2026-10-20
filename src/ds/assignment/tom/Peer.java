@@ -2,12 +2,15 @@ package ds.assignment.tom;
 
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -25,7 +28,8 @@ import java.util.concurrent.PriorityBlockingQueue;
 public class Peer {
     static final int DEFAULT_PORT = 8000;
     private static final int CONNECT_TIMEOUT_MS = 1000;
-    private static final int MESSAGE_RATE_PER_MIN = 10;  // Default messages per minute
+    private static final int MESSAGE_RATE_PER_MIN = 60;  // Default: 1 message per second
+    private static final int MAX_CLOCK_DRIFT = 100;  // Maximum allowed future timestamp drift
 
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
@@ -39,6 +43,14 @@ public class Peer {
     private int messageCounter;
     private final Random random;
     private final int messageRatePerMin;
+    private final List<String> dictionary;
+
+    // Malicious peer detection: track highest timestamp seen from each peer
+    private final Map<String, Integer> peerMaxTimestamps;
+    // Track (timestamp, senderId) pairs to detect timestamp reuse
+    private final Set<String> seenTimestamps;
+    // Blacklist of detected malicious peers
+    private final Set<String> blacklistedPeers;
 
     private static class Message implements Comparable<Message> {
         final int timestamp;
@@ -92,6 +104,43 @@ public class Peer {
         this.messageCounter = 0;
         this.random = new Random();
         this.messageRatePerMin = messageRatePerMin;
+        this.dictionary = loadDictionary();
+        this.peerMaxTimestamps = new ConcurrentHashMap<>();
+        this.seenTimestamps = ConcurrentHashMap.newKeySet();
+        this.blacklistedPeers = ConcurrentHashMap.newKeySet();
+    }
+
+    private List<String> loadDictionary() {
+        List<String> words = new ArrayList<>();
+        try {
+            // Try to load from resources folder first
+            java.nio.file.Path path = Paths.get("resources/words.txt");
+            if (Files.exists(path)) {
+                words = Files.readAllLines(path);
+            } else {
+                // Fallback: try to load from classpath
+                InputStream is = getClass().getClassLoader().getResourceAsStream("words.txt");
+                if (is != null) {
+                    try (BufferedReader br = new BufferedReader(new InputStreamReader(is))) {
+                        String line;
+                        while ((line = br.readLine()) != null) {
+                            words.add(line.trim());
+                        }
+                    }
+                }
+            }
+
+            if (words.isEmpty()) {
+                log("WARNING: Dictionary not found, using fallback words");
+                // Fallback to a small list if dictionary file is not found
+                words = Arrays.asList("hello", "world", "distributed", "systems", "consensus",
+                                     "multicast", "lamport", "clock", "message", "network");
+            }
+        } catch (IOException e) {
+            log("ERROR loading dictionary: " + e.getMessage());
+            words = Arrays.asList("hello", "world", "distributed", "systems", "consensus");
+        }
+        return words;
     }
 
     public static void main(String[] args) throws Exception {
@@ -183,6 +232,13 @@ public class Peer {
                     int messageId = Integer.parseInt(parts[3]);
                     String content = parts.length > 4 ? parts[4] : "";
 
+                    // Validate message for malicious behavior
+                    if (!validateMessage(timestamp, senderId)) {
+                        log("⚠️  MALICIOUS: rejected message from " + senderId + " [" + timestamp + "]");
+                        out.println("REJECT " + senderId + " " + messageId);
+                        continue;
+                    }
+
                     synchronized (this) {
                         lamportClock = Math.max(lamportClock, timestamp) + 1;
                     }
@@ -220,6 +276,58 @@ public class Peer {
         }
     }
 
+    /**
+     * Validates a message to detect malicious peer behavior:
+     * (a) "Rewriting history": using a timestamp already seen from this peer
+     * (b) "Writing in the future": using a timestamp too far ahead of current clock
+     *
+     * @return true if message is valid, false if malicious behavior detected
+     */
+    private synchronized boolean validateMessage(int timestamp, String senderId) {
+        // Check if peer is already blacklisted
+        if (blacklistedPeers.contains(senderId)) {
+            return false;
+        }
+
+        // Create unique key for this (timestamp, sender) pair
+        String timestampKey = senderId + ":" + timestamp;
+
+        // (a) Detect "rewriting history": same timestamp used twice by same peer
+        if (seenTimestamps.contains(timestampKey)) {
+            log("🚨 MALICIOUS BEHAVIOR DETECTED: " + senderId +
+                " reusing timestamp " + timestamp + " (rewriting history)");
+            blacklistedPeers.add(senderId);
+            return false;
+        }
+
+        // Get the highest timestamp we've seen from this peer
+        Integer maxTimestamp = peerMaxTimestamps.get(senderId);
+
+        if (maxTimestamp != null && timestamp < maxTimestamp) {
+            // (a) Detect "rewriting history": timestamp going backwards
+            log("🚨 MALICIOUS BEHAVIOR DETECTED: " + senderId +
+                " sent timestamp " + timestamp + " after sending " + maxTimestamp +
+                " (going backwards in time)");
+            blacklistedPeers.add(senderId);
+            return false;
+        }
+
+        // (b) Detect "writing in the future": timestamp too far ahead
+        if (timestamp > lamportClock + MAX_CLOCK_DRIFT) {
+            log("🚨 MALICIOUS BEHAVIOR DETECTED: " + senderId +
+                " sent timestamp " + timestamp + " when current clock is " + lamportClock +
+                " (writing too far in the future)");
+            blacklistedPeers.add(senderId);
+            return false;
+        }
+
+        // Message is valid - record the timestamp
+        seenTimestamps.add(timestampKey);
+        peerMaxTimestamps.put(senderId, Math.max(maxTimestamp != null ? maxTimestamp : 0, timestamp));
+
+        return true;
+    }
+
     private void connectToPeer(InetSocketAddress peer) {
         String reply = sendMessage(peer, "HELLO " + name + " " +
                                    InetAddress.getLoopbackAddress().getHostAddress() + " " + port);
@@ -239,8 +347,9 @@ public class Peer {
                 double delay = -Math.log(1 - random.nextDouble()) / lambda * 1000;  // milliseconds
                 Thread.sleep((long) delay);
 
-                // Generate and multicast a new message
-                multicastMessage("Message " + messageCounter);
+                // Generate and multicast a new message with a random word from dictionary
+                String randomWord = dictionary.get(random.nextInt(dictionary.size()));
+                multicastMessage(randomWord);
             }
         } catch (InterruptedException e) {
             log("message generator stopped");
