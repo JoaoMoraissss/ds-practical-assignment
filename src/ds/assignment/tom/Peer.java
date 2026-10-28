@@ -15,6 +15,8 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.PriorityBlockingQueue;
 
 /**
@@ -22,8 +24,11 @@ import java.util.concurrent.PriorityBlockingQueue;
  *
  * Usage: Peer <peer-host[:port]> ... [--port N] [--name NAME] [--rate R]
  *
- * Each peer multicasts messages to all other peers with a Lamport timestamp.
- * Messages are delivered in total order: sorted by (timestamp, sender-id).
+ * The arguments list every other peer. Each peer multicasts random words with a
+ * Lamport timestamp; every receiver multicasts an ACK to all peers. A message is
+ * delivered (printed) when it is at the head of the queue, ordered by
+ * (timestamp, sender), and has been acknowledged by every peer. Messages to each
+ * peer leave through a single thread, so channels are FIFO.
  */
 public class Peer {
     static final int DEFAULT_PORT = 8000;
@@ -36,14 +41,16 @@ public class Peer {
     private final String name;
     private final int port;
     private final List<InetSocketAddress> peers;
-    private final Map<String, InetSocketAddress> peerAddresses;
-    private final Set<String> acksReceived;
+    private final Map<String, Set<String>> acks = new ConcurrentHashMap<>();
+    private final Map<InetSocketAddress, ExecutorService> outbox = new ConcurrentHashMap<>();
     private final PriorityBlockingQueue<Message> messageQueue;
     private int lamportClock;
     private int messageCounter;
     private final Random random;
     private final int messageRatePerMin;
     private final List<String> dictionary;
+    private String evil;          // demo only: "past" or "future" makes this peer cheat
+    private int lastTimestamp;
 
     // Malicious peer detection: track highest timestamp seen from each peer
     private final Map<String, Integer> peerMaxTimestamps;
@@ -57,14 +64,12 @@ public class Peer {
         final String senderId;
         final int messageId;
         final String content;
-        final Set<String> acks;
 
         Message(int timestamp, String senderId, int messageId, String content) {
             this.timestamp = timestamp;
             this.senderId = senderId;
             this.messageId = messageId;
             this.content = content;
-            this.acks = ConcurrentHashMap.newKeySet();
         }
 
         @Override
@@ -97,8 +102,6 @@ public class Peer {
         this.name = name;
         this.port = port;
         this.peers = new ArrayList<>(peers);
-        this.peerAddresses = new ConcurrentHashMap<>();
-        this.acksReceived = ConcurrentHashMap.newKeySet();
         this.messageQueue = new PriorityBlockingQueue<>();
         this.lamportClock = 0;
         this.messageCounter = 0;
@@ -144,24 +147,35 @@ public class Peer {
     }
 
     public static void main(String[] args) throws Exception {
-        String name = "peer";
+        String name = InetAddress.getLocalHost().getHostName();
         int port = DEFAULT_PORT;
         int messageRatePerMin = MESSAGE_RATE_PER_MIN;
         List<InetSocketAddress> peers = new ArrayList<>();
+        String evil = null;
 
-        for (String arg : args) {
-            if (arg.startsWith("--port=")) {
-                port = Integer.parseInt(arg.substring(7));
-            } else if (arg.startsWith("--name=")) {
-                name = arg.substring(7);
-            } else if (arg.startsWith("--rate=")) {
-                messageRatePerMin = Integer.parseInt(arg.substring(7));
-            } else if (!arg.startsWith("--")) {
-                peers.add(parseAddress(arg, DEFAULT_PORT));
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
+            String option = arg, value = null;
+            if (arg.startsWith("--") && arg.contains("=")) {
+                option = arg.substring(0, arg.indexOf('='));
+                value = arg.substring(arg.indexOf('=') + 1);
+            } else if (arg.startsWith("--") && i + 1 < args.length) {
+                value = args[++i];
+            }
+            switch (option) {
+                case "--port": port = Integer.parseInt(value); break;
+                case "--name": name = value; break;
+                case "--rate": messageRatePerMin = Integer.parseInt(value); break;
+                case "--evil": evil = value; break;
+                default:
+                    if (arg.startsWith("--")) throw new IllegalArgumentException("unknown option " + arg);
+                    peers.add(parseAddress(arg, DEFAULT_PORT));
             }
         }
 
-        new Peer(name, port, peers, messageRatePerMin).run();
+        Peer peer = new Peer(name, port, peers, messageRatePerMin);
+        peer.evil = evil;
+        peer.run();
     }
 
     private static InetSocketAddress parseAddress(String spec, int defaultPort) {
@@ -173,7 +187,6 @@ public class Peer {
 
     private void run() throws Exception {
         // Register this peer's address for acknowledgments
-        peerAddresses.put(name, new InetSocketAddress(InetAddress.getLocalHost(), port));
 
         // Start listener thread
         new Thread(this::listener).start();
@@ -181,9 +194,6 @@ public class Peer {
 
         // Connect to all known peers
         Thread.sleep(500);  // Give time for all peers to start
-        for (InetSocketAddress peer : peers) {
-            new Thread(() -> connectToPeer(peer)).start();
-        }
 
         // Wait for peer connections to establish
         Thread.sleep(1000);
@@ -216,16 +226,7 @@ public class Peer {
                 String[] parts = line.split(" ", 5);
                 String messageType = parts[0];
 
-                if (messageType.equals("HELLO")) {
-                    // HELLO <name> <host> <port>
-                    String peerName = parts[1];
-                    String host = parts[2];
-                    int peerPort = Integer.parseInt(parts[3]);
-                    peerAddresses.put(peerName, new InetSocketAddress(host, peerPort));
-                    log("registered peer " + peerName + " at " + host + ":" + peerPort);
-                    out.println("OK");
-
-                } else if (messageType.equals("MSG")) {
+                if (messageType.equals("MSG")) {
                     // MSG <timestamp> <senderId> <messageId> <content>
                     int timestamp = Integer.parseInt(parts[1]);
                     String senderId = parts[2];
@@ -244,11 +245,14 @@ public class Peer {
                     }
 
                     Message msg = new Message(timestamp, senderId, messageId, content);
+                    ack(msg.getKey(), senderId);
+                    ack(msg.getKey(), name);
                     messageQueue.offer(msg);
                     log("received message [" + timestamp + ", " + senderId + ":" + messageId + "] \"" + content + "\"");
 
                     // Send ACK back
-                    out.println("ACK " + senderId + " " + messageId + " " + name);
+                    sendToAll("ACK " + senderId + " " + messageId + " " + name);
+                    out.println("OK");
 
                 } else if (messageType.equals("ACK")) {
                     // ACK <senderId> <messageId> <ackFrom>
@@ -257,18 +261,8 @@ public class Peer {
                     String ackFrom = parts[3];
                     String key = senderId + ":" + messageId;
 
-                    // Record this acknowledgment
-                    synchronized (this) {
-                        acksReceived.add(key + ":" + ackFrom);
-                    }
-
-                    // Update the message in the queue with this ACK
-                    for (Message msg : messageQueue) {
-                        if (msg.getKey().equals(key)) {
-                            msg.acks.add(ackFrom);
-                            break;
-                        }
-                    }
+                    ack(senderId + ":" + messageId, ackFrom);
+                    out.println("OK");
                 }
             }
         } catch (IOException e) {
@@ -328,16 +322,6 @@ public class Peer {
         return true;
     }
 
-    private void connectToPeer(InetSocketAddress peer) {
-        String reply = sendMessage(peer, "HELLO " + name + " " +
-                                   InetAddress.getLoopbackAddress().getHostAddress() + " " + port);
-        if (reply != null && reply.equals("OK")) {
-            log("connected to peer at " + peer);
-        } else {
-            log("failed to connect to peer at " + peer);
-        }
-    }
-
     private void generateMessages() {
         try {
             // Calculate delay between messages (Poisson process)
@@ -360,30 +344,31 @@ public class Peer {
         lamportClock++;
         int timestamp = lamportClock;
         int msgId = messageCounter++;
+        // Malicious behaviour for the demo, from the 4th message on
+        if ("past".equals(evil) && msgId >= 3) {
+            timestamp = lastTimestamp;               // reuses an old timestamp
+            log("EVIL: reusing timestamp " + timestamp);
+        } else if ("future".equals(evil) && msgId >= 3) {
+            timestamp = lamportClock + 1000;         // jumps far ahead
+            log("EVIL: sending timestamp " + timestamp);
+        }
+        lastTimestamp = timestamp;
 
         Message msg = new Message(timestamp, name, msgId, content);
-        msg.acks.add(name);  // Implicitly ACK our own message
+        ack(msg.getKey(), name);
         messageQueue.offer(msg);
 
         log("multicast [" + timestamp + ", " + name + ":" + msgId + "] \"" + content + "\"");
 
-        // Send to all known peers
-        for (Map.Entry<String, InetSocketAddress> entry : peerAddresses.entrySet()) {
-            if (!entry.getKey().equals(name)) {
-                InetSocketAddress addr = entry.getValue();
-                new Thread(() -> {
-                    sendMessage(addr, "MSG " + timestamp + " " + name + " " + msgId + " " + content);
-                }).start();
-            }
-        }
+        sendToAll("MSG " + timestamp + " " + name + " " + msgId + " " + content);
     }
 
     private void deliveryLoop() throws InterruptedException {
         while (true) {
             Thread.sleep(100);  // Check delivery conditions periodically
 
-            Message msg = messageQueue.peek();
-            if (msg != null && canDeliver(msg)) {
+            Message msg;
+            while ((msg = messageQueue.peek()) != null && canDeliver(msg)) {
                 messageQueue.poll();
                 deliverMessage(msg);
             }
@@ -395,8 +380,7 @@ public class Peer {
         // 1. We have ACKs from all known peers (including ourselves)
         // 2. It is the smallest message in the queue (already at head due to priority queue)
 
-        int expectedAcks = peerAddresses.size();
-        if (msg.acks.size() < expectedAcks) {
+        if (acks.getOrDefault(msg.getKey(), Set.of()).size() < peers.size() + 1) {
             return false;
         }
 
@@ -412,6 +396,21 @@ public class Peer {
 
     private void deliverMessage(Message msg) {
         log("deliver [" + msg.timestamp + ", " + msg.senderId + ":" + msg.messageId + "] \"" + msg.content + "\"");
+    }
+
+    private void ack(String key, String from) {
+        acks.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet()).add(from);
+    }
+
+    private void sendToAll(String message) {
+        for (InetSocketAddress peer : peers) {
+            outbox.computeIfAbsent(peer, p -> Executors.newSingleThreadExecutor())
+                  .submit(() -> {
+                      while (sendMessage(peer, message) == null) {
+                          try { Thread.sleep(500); } catch (InterruptedException e) { return; }
+                      }
+                  });
+        }
     }
 
     private String sendMessage(InetSocketAddress target, String message) {

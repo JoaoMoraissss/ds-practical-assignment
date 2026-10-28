@@ -142,3 +142,74 @@ results/p2p-convergence.png.
 
   * Each size is simulated 5 times (--runs); the plot shows every simulation
     and the mean for each size.
+
+Exercise 3 - Totally-Ordered Multicast
+--------------------------------------
+Quick demo on a single machine (6 peers on different ports, each one knowing
+all the others):
+
+  $ ./scripts/tom-local.sh          # 6 peers, 1 random word per second each
+  $ ./scripts/tom-check.sh          # afterwards: did every peer print the same order?
+
+Each peer also writes the words it delivers to logs/tom-pN.txt, which is what
+tom-check.sh compares.
+
+On 6 machines, after compiling on each (every peer gets the IPs of the other 5):
+
+  m1$ java -cp build ds.assignment.tom.Peer IP-of-m2 IP-of-m3 IP-of-m4 IP-of-m5 IP-of-m6 --name p1
+  m2$ java -cp build ds.assignment.tom.Peer IP-of-m1 IP-of-m3 IP-of-m4 IP-of-m5 IP-of-m6 --name p2
+  ... and likewise on m3..m6.
+
+Run it from the project directory, so that resources/words.txt (the dictionary
+from which words are chosen) is found. Peers can be started in any order:
+messages to a peer that is not up yet are retried until it is.
+
+Peer options:
+  --port N      port where this peer listens (default 8000)
+  --name NAME   peer identifier, must be unique (default: the host name)
+  --rate R      words per minute (default 60, i.e. 1 per second)
+
+How it works:
+
+  * Lamport clock. A peer increments its clock before sending a message and
+    stamps the message with it; on receiving a message with timestamp t it sets
+    its clock to max(clock, t) + 1.
+
+  * Multicast. Every 1 s on average (Poisson process) a peer picks a random word
+    and sends "MSG <timestamp> <sender> <id> <word>" to all other peers, and
+    puts the message in its own queue.
+
+  * Acknowledgements. A peer that receives a message puts it in its queue and
+    sends "ACK <sender> <id> <me>" to ALL peers.
+
+  * Delivery. The queue is ordered by (timestamp, sender name), which is a total
+    order. A message is delivered (its word printed) only when it is at the
+    head of the queue and has been acknowledged by every peer. Messages to each
+    peer are sent by a single thread, in order (FIFO channels), so once every
+    peer has acknowledged a message, no message with a smaller timestamp can
+    still arrive. Every peer therefore prints the same sequence of words.
+
+Malicious peers (extra marks)
+-----------------------------
+Every peer checks the timestamps it receives from each sender:
+
+  (a) Rewriting history: since channels are FIFO and clocks only grow, the
+      timestamps of an honest sender are strictly increasing. A message that
+      reuses a timestamp already seen from that sender, or is lower than one,
+      is rejected.
+
+  (b) Writing in the future: a timestamp more than 100 ahead of the receiver's
+      own clock cannot come from an honest peer (all clocks advance together
+      with the messages), so it is rejected.
+
+A peer caught cheating is blacklisted: all its later messages are rejected and
+are never delivered, so it cannot change the order seen by the honest peers.
+
+To see it, make p6 cheat from its 4th message on:
+
+  $ ./scripts/tom-local.sh past     # p6 reuses an old timestamp
+  $ ./scripts/tom-local.sh future   # p6 jumps 1000 ahead
+
+(the option behind this is --evil past|future). The other peers log
+"MALICIOUS BEHAVIOR DETECTED" and keep delivering the same sequence; p6 itself
+blocks, since its own message is never acknowledged.
