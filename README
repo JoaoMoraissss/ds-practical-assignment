@@ -67,10 +67,16 @@ To try it with the local demo running, from another terminal:
   $ java -cp build ds.assignment.tring.Peer localhost:5004 localhost:6000 \
         --port 5003 --name p3                       # p3 rejoins
 
-Limitations: two consecutive dead peers stop the ring, because only one backup
-address is known. If two peers regenerate the token within the same few
-seconds, two tokens with the same epoch exist; the random part of the timeout
-makes this unlikely but not impossible.
+  * Two regenerated tokens. If two peers regenerate the token at about the same
+    time, both new tokens have the same epoch. The token therefore also carries
+    the name of the peer that created it, and tokens are compared by (epoch,
+    creator name): a peer discards a token lower than the highest it has seen.
+    The lower token is dropped at the first peer that has already seen the
+    higher one, so only one survives. (Peer names must be unique.) To see it,
+    start two peers with --token: one of the tokens is discarded within a round.
+
+Limitation: two consecutive dead peers stop the ring, because only one backup
+address is known.
 
 Exercise 2 - Anti-Entropy
 -------------------------
