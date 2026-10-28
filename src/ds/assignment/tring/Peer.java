@@ -28,8 +28,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Fault tolerance: the next peer acknowledges the token with the address of its
  * own successor, so a peer whose successor is down can skip it. A peer that sees
- * no token for too long regenerates it with a higher generation number (epoch),
- * and tokens of an older generation are discarded.
+ * no token for too long regenerates it with a higher generation number (epoch).
+ * The token carries its epoch and the name of the peer that created it; a peer
+ * discards any token lower, in (epoch, creator) order, than the highest it has
+ * seen, so if two peers regenerate at the same time only one token survives.
  */
 public class Peer {
     static final int DEFAULT_PORT = 5000;
@@ -56,6 +58,7 @@ public class Peer {
     // Fault tolerance state, used only by the token thread.
     private InetSocketAddress nextNext;   // learned from the ACK of the next peer
     private long epoch = 0;               // highest token generation seen so far
+    private String creator = "";          // peer that created that token (tie-breaker)
     // Random extra, so that two peers rarely regenerate at the same time.
     private final int tokenTimeoutMs = TOKEN_TIMEOUT_MS + new Random().nextInt(10_000);
 
@@ -117,6 +120,7 @@ public class Peer {
             generator.start();
 
             if (startsWithToken) {
+                creator = name;
                 log("creating the token");
                 listener.setSoTimeout(tokenTimeoutMs);
                 onToken();
@@ -158,15 +162,21 @@ public class Peer {
             }
             // Tell the sender who comes after us, so it can skip us if we fail.
             out.println("ACK " + next.getHostString() + ":" + next.getPort());
-            long received = Long.parseLong(line.substring(TOKEN.length() + 1));
-            if (received < epoch) {
-                log("discarding old token (epoch " + received + " < " + epoch + ")");
+            String[] parts = line.split(" ");
+            long receivedEpoch = Long.parseLong(parts[1]);
+            String receivedCreator = parts.length > 2 ? parts[2] : "";
+            if (receivedEpoch < epoch
+                    || (receivedEpoch == epoch && receivedCreator.compareTo(creator) < 0)) {
+                log("discarding duplicate token (epoch " + receivedEpoch + " by " + receivedCreator
+                        + ", already seen epoch " + epoch + " by " + creator + ")");
                 return false;
             }
-            epoch = received;
+            epoch = receivedEpoch;
+            creator = receivedCreator;
             return true;
         } catch (SocketTimeoutException e) {
             epoch++;
+            creator = name;
             log("no token for " + tokenTimeoutMs + " ms, regenerating it (epoch " + epoch + ")");
             return true;
         } catch (IOException e) {
@@ -233,7 +243,7 @@ public class Peer {
             socket.setSoTimeout(ACK_TIMEOUT_MS);
             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            out.println(TOKEN + " " + epoch);
+            out.println(TOKEN + " " + epoch + " " + creator);
             String ack = in.readLine();
             if (ack == null || !ack.startsWith("ACK ")) {
                 return false;
